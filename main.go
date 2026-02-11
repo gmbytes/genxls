@@ -177,7 +177,7 @@ func main() {
 	flag.StringVar(&opts.InPath, "in", "", "input xlsx file or directory (default: ./xls)")
 	flag.StringVar(&opts.OutDir, "out", ".", "output directory")
 	flag.StringVar(&opts.Flag, "flag", "", "export flag: server|client (optional)")
-	flag.StringVar(&opts.Lang, "lang", "all", "target lang: go|cs|ts|all (or comma-separated)")
+	flag.StringVar(&opts.Lang, "lang", "all", "target lang: go|Pb|ts|all (or comma-separated)")
 	flag.StringVar(&opts.Pkg, "pkg", "config", "go package name")
 	flag.BoolVar(&opts.JSON, "json", true, "export json data")
 	flag.BoolVar(&opts.Verbose, "v", false, "verbose")
@@ -205,7 +205,7 @@ func main() {
 	rootName := "AllConfig"
 
 	// Aggregated output:
-	// - generate one go.gen.go/cs.gen.cs/ts.gen.ts
+	// - generate one go.gen.go/Pb.gen.Pb/ts.gen.ts
 	// - generate one all.json with keys based on sheet name (pluralized)
 	schemas := make(map[string][]Field)      // typeName -> fields
 	jsonPayload := make(map[string]any)      // jsonKey -> []object
@@ -285,12 +285,12 @@ func main() {
 			fmt.Fprintf(os.Stderr, "generated %s\n", outFile)
 		}
 	}
-	if langs["cs"] {
+	if langs["Pb"] {
 		csCode, err := generateCSBundle(rootName, orderedTypeNames, schemas)
 		if err != nil {
 			exitErr(err)
 		}
-		outFile := filepath.Join(opts.OutDir, "cs.gen.cs")
+		outFile := filepath.Join(opts.OutDir, "Pb.gen.Pb")
 		if err := os.WriteFile(outFile, []byte(csCode), 0o644); err != nil {
 			exitErr(err)
 		}
@@ -330,23 +330,23 @@ func main() {
 func parseLangs(s string) (map[string]bool, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" || s == "all" {
-		return map[string]bool{"go": true, "cs": true, "ts": true}, nil
+		return map[string]bool{"go": true, "Pb": true, "ts": true}, nil
 	}
 	parts := strings.Split(s, ",")
-	out := map[string]bool{"go": false, "cs": false, "ts": false}
+	out := map[string]bool{"go": false, "Pb": false, "ts": false}
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
 		switch p {
-		case "go", "cs", "ts":
+		case "go", "Pb", "ts":
 			out[p] = true
 		default:
-			return nil, fmt.Errorf("invalid --lang %q (expect go|cs|ts|all or comma-separated)", s)
+			return nil, fmt.Errorf("invalid --lang %q (expect go|Pb|ts|all or comma-separated)", s)
 		}
 	}
-	if !out["go"] && !out["cs"] && !out["ts"] {
+	if !out["go"] && !out["Pb"] && !out["ts"] {
 		return nil, fmt.Errorf("invalid --lang %q (no targets)", s)
 	}
 	return out, nil
