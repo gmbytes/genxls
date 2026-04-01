@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/xuri/excelize/v2"
 )
@@ -163,13 +167,14 @@ type HeaderSpec struct {
 }
 
 type Options struct {
-	InPath  string
-	OutDir  string
-	Flag    string
-	Lang    string
-	Pkg     string
-	JSON    bool
-	Verbose bool
+	InPath   string
+	OutDir   string
+	Flag     string
+	Lang     string
+	Pkg      string
+	JSON     bool
+	SplitJSON bool
+	Verbose  bool
 }
 
 func main() {
@@ -177,9 +182,10 @@ func main() {
 	flag.StringVar(&opts.InPath, "in", "", "input xlsx file or directory (default: ./xls)")
 	flag.StringVar(&opts.OutDir, "out", ".", "output directory")
 	flag.StringVar(&opts.Flag, "flag", "", "export flag: server|client (optional)")
-	flag.StringVar(&opts.Lang, "lang", "all", "target lang: go|Pb|ts|all (or comma-separated)")
+	flag.StringVar(&opts.Lang, "lang", "all", "target lang: go|Pb|ts|rust|all (or comma-separated)")
 	flag.StringVar(&opts.Pkg, "pkg", "config", "go package name")
 	flag.BoolVar(&opts.JSON, "json", true, "export json data")
+	flag.BoolVar(&opts.SplitJSON, "split-json", false, "split each table into separate json file + manifest")
 	flag.BoolVar(&opts.Verbose, "v", false, "verbose")
 	flag.Parse()
 
@@ -207,10 +213,11 @@ func main() {
 	// Aggregated output:
 	// - generate one go.gen.go/Pb.gen.Pb/ts.gen.ts
 	// - generate one all.json with keys based on sheet name (pluralized)
-	schemas := make(map[string][]Field)      // typeName -> fields
-	jsonPayload := make(map[string]any)      // jsonKey -> []object
-	seenKeys := make(map[string]string)      // jsonKey -> origin (file/sheet)
-	orderedTypeNames := make([]string, 0, 8) // stable output order
+	schemas := make(map[string][]Field)        // typeName -> fields
+	jsonPayload := make(map[string]any)        // jsonKey -> []object
+	seenKeys := make(map[string]string)        // jsonKey -> origin (file/sheet)
+	orderedTypeNames := make([]string, 0, 8)   // stable output order
+	jsonKeyToTypeName := make(map[string]string) // jsonKey -> typeName (for manifest)
 
 	addSheet := func(origin string, sheetName string, rows [][]string) {
 		spec, err := detectHeaderSpec(rows)
@@ -241,6 +248,7 @@ func main() {
 		seenKeys[jsonKey] = origin
 		schemas[typeName] = fields
 		jsonPayload[jsonKey] = items
+		jsonKeyToTypeName[jsonKey] = typeName
 		orderedTypeNames = append(orderedTypeNames, typeName)
 	}
 
@@ -312,6 +320,20 @@ func main() {
 		}
 	}
 
+	if langs["rust"] {
+		rustCode, err := generateRustBundle(rootName, orderedTypeNames, schemas)
+		if err != nil {
+			exitErr(err)
+		}
+		outFile := filepath.Join(opts.OutDir, "config.gen.rs")
+		if err := os.WriteFile(outFile, []byte(rustCode), 0o644); err != nil {
+			exitErr(err)
+		}
+		if opts.Verbose {
+			fmt.Fprintf(os.Stderr, "generated %s\n", outFile)
+		}
+	}
+
 	if opts.JSON {
 		data, err := json.MarshalIndent(jsonPayload, "", "  ")
 		if err != nil {
@@ -325,28 +347,38 @@ func main() {
 			fmt.Fprintf(os.Stderr, "generated %s\n", jsonFile)
 		}
 	}
+
+	if opts.SplitJSON {
+		if err := writeSplitJSONAndManifest(opts.OutDir, jsonPayload, orderedTypeNames, jsonKeyToTypeName, opts.Verbose); err != nil {
+			exitErr(err)
+		}
+	}
 }
 
 func parseLangs(s string) (map[string]bool, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" || s == "all" {
-		return map[string]bool{"go": true, "Pb": true, "ts": true}, nil
+		return map[string]bool{"go": true, "Pb": true, "ts": true, "rust": false}, nil
 	}
 	parts := strings.Split(s, ",")
-	out := map[string]bool{"go": false, "Pb": false, "ts": false}
+	out := map[string]bool{"go": false, "Pb": false, "ts": false, "rust": false}
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
 		switch p {
-		case "go", "Pb", "ts":
-			out[p] = true
+		case "go", "pb", "ts", "rust":
+			key := p
+			if key == "pb" {
+				key = "Pb"
+			}
+			out[key] = true
 		default:
-			return nil, fmt.Errorf("invalid --lang %q (expect go|Pb|ts|all or comma-separated)", s)
+			return nil, fmt.Errorf("invalid --lang %q (expect go|Pb|ts|rust|all or comma-separated)", s)
 		}
 	}
-	if !out["go"] && !out["Pb"] && !out["ts"] {
+	if !out["go"] && !out["Pb"] && !out["ts"] && !out["rust"] {
 		return nil, fmt.Errorf("invalid --lang %q (no targets)", s)
 	}
 	return out, nil
@@ -875,4 +907,174 @@ func parseBraceArrayJSON(s string, out any) error {
 		s = "[" + s + "]"
 	}
 	return json.Unmarshal([]byte(s), out)
+}
+
+// ── Rust code generation ──
+
+func mapRustType(t string) (string, bool) {
+	switch strings.ToLower(t) {
+	case "int", "int32", "int64":
+		return "i64", true
+	case "int[]":
+		return "Vec<i64>", true
+	case "int[][]":
+		return "Vec<Vec<i64>>", true
+	case "float", "float32", "float64":
+		return "f64", true
+	case "bool":
+		return "bool", true
+	case "string":
+		return "String", true
+	default:
+		return "", false
+	}
+}
+
+func toSnakeCase(s string) string {
+	var buf strings.Builder
+	for i, r := range s {
+		if unicode.IsUpper(r) {
+			if i > 0 {
+				prev := rune(s[i-1])
+				if unicode.IsLower(prev) || unicode.IsDigit(prev) {
+					buf.WriteByte('_')
+				}
+			}
+			buf.WriteRune(unicode.ToLower(r))
+		} else {
+			buf.WriteRune(r)
+		}
+	}
+	return buf.String()
+}
+
+func generateRustBundle(rootName string, orderedTypeNames []string, schemas map[string][]Field) (string, error) {
+	var b strings.Builder
+	b.WriteString("// Auto-generated by genxls. DO NOT EDIT.\n\n")
+	b.WriteString("use serde::Deserialize;\n\n")
+
+	for _, typeName := range orderedTypeNames {
+		fields := schemas[typeName]
+		b.WriteString("#[derive(Debug, Clone, Deserialize)]\n")
+		b.WriteString("pub struct ")
+		b.WriteString(typeName)
+		b.WriteString(" {\n")
+		for _, f := range fields {
+			rustType, ok := mapRustType(f.RawType)
+			if !ok {
+				return "", fmt.Errorf("unsupported type %q for Rust", f.RawType)
+			}
+			snakeName := toSnakeCase(f.Name)
+			if snakeName != f.RawName {
+				b.WriteString("    #[serde(rename = \"")
+				b.WriteString(f.RawName)
+				b.WriteString("\")]\n")
+			}
+			b.WriteString("    pub ")
+			b.WriteString(snakeName)
+			b.WriteString(": ")
+			b.WriteString(rustType)
+			b.WriteString(",\n")
+		}
+		b.WriteString("}\n\n")
+	}
+
+	b.WriteString("#[derive(Debug, Clone, Deserialize)]\n")
+	b.WriteString("pub struct ")
+	b.WriteString(rootName)
+	b.WriteString(" {\n")
+	for _, typeName := range orderedTypeNames {
+		fieldName := pluralizeTypeName(typeName)
+		jsonKey := lowerFirst(fieldName)
+		snakeName := toSnakeCase(fieldName)
+		if snakeName != jsonKey {
+			b.WriteString("    #[serde(rename = \"")
+			b.WriteString(jsonKey)
+			b.WriteString("\")]\n")
+		}
+		b.WriteString("    pub ")
+		b.WriteString(snakeName)
+		b.WriteString(": Vec<")
+		b.WriteString(typeName)
+		b.WriteString(">,\n")
+	}
+	b.WriteString("}\n")
+
+	return b.String(), nil
+}
+
+// ── Split JSON + Manifest ──
+
+type ManifestTableEntry struct {
+	File     string `json:"file"`
+	Sha256   string `json:"sha256"`
+	Size     int64  `json:"size"`
+	RowCount int    `json:"row_count"`
+	RustType string `json:"rust_type"`
+}
+
+type ManifestFile struct {
+	Version string                        `json:"version"`
+	Tables  map[string]ManifestTableEntry `json:"tables"`
+}
+
+func writeSplitJSONAndManifest(outDir string, jsonPayload map[string]any, orderedTypeNames []string, jsonKeyToTypeName map[string]string, verbose bool) error {
+	tablesDir := filepath.Join(outDir, "tables")
+	if err := os.MkdirAll(tablesDir, 0o755); err != nil {
+		return err
+	}
+
+	manifest := ManifestFile{
+		Version: time.Now().Format("20060102"),
+		Tables:  make(map[string]ManifestTableEntry),
+	}
+
+	for _, typeName := range orderedTypeNames {
+		fieldName := pluralizeTypeName(typeName)
+		jsonKey := lowerFirst(fieldName)
+		items := jsonPayload[jsonKey]
+
+		data, err := json.MarshalIndent(items, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal %s: %w", jsonKey, err)
+		}
+
+		relPath := "tables/" + jsonKey + ".json"
+		absPath := filepath.Join(outDir, relPath)
+		if err := os.WriteFile(absPath, data, 0o644); err != nil {
+			return err
+		}
+
+		h := sha256.Sum256(data)
+		rowCount := 0
+		if arr, ok := items.([]map[string]any); ok {
+			rowCount = len(arr)
+		}
+
+		manifest.Tables[jsonKey] = ManifestTableEntry{
+			File:     relPath,
+			Sha256:   hex.EncodeToString(h[:]),
+			Size:     int64(len(data)),
+			RowCount: rowCount,
+			RustType: typeName,
+		}
+
+		if verbose {
+			fmt.Fprintf(os.Stderr, "generated %s\n", absPath)
+		}
+	}
+
+	manifestData, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	manifestPath := filepath.Join(outDir, "manifest.json")
+	if err := os.WriteFile(manifestPath, manifestData, 0o644); err != nil {
+		return err
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "generated %s\n", manifestPath)
+	}
+
+	return nil
 }
