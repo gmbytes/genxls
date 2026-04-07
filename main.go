@@ -182,7 +182,7 @@ func main() {
 	flag.StringVar(&opts.InPath, "in", "", "input xlsx file or directory (default: ./xls)")
 	flag.StringVar(&opts.OutDir, "out", ".", "output directory")
 	flag.StringVar(&opts.Flag, "flag", "", "export flag: server|client (optional)")
-	flag.StringVar(&opts.Lang, "lang", "all", "target lang: go|Pb|ts|rust|all (or comma-separated)")
+	flag.StringVar(&opts.Lang, "lang", "all", "target lang: go|gd|all (or comma-separated)")
 	flag.StringVar(&opts.Pkg, "pkg", "config", "go package name")
 	flag.BoolVar(&opts.JSON, "json", true, "export json data")
 	flag.BoolVar(&opts.SplitJSON, "split-json", false, "split each table into separate json file + manifest")
@@ -211,7 +211,7 @@ func main() {
 	rootName := "AllConfig"
 
 	// Aggregated output:
-	// - generate one go.gen.go/Pb.gen.Pb/ts.gen.ts
+	// - generate one go.gen.go and/or gd/ directory
 	// - generate one all.json with keys based on sheet name (pluralized)
 	schemas := make(map[string][]Field)        // typeName -> fields
 	jsonPayload := make(map[string]any)        // jsonKey -> []object
@@ -230,6 +230,16 @@ func main() {
 		fields, err := parseFieldsFromDefineRow(rows, spec.DefineRow, opts.Flag)
 		if err != nil {
 			exitErr(fmt.Errorf("%s: %w", origin, err))
+		}
+		hasCid := false
+		for _, f := range fields {
+			if f.RawName == "cid" {
+				hasCid = true
+				break
+			}
+		}
+		if !hasCid {
+			exitErr(fmt.Errorf("%s: sheet missing required field 'cid#int' (unique key)", origin))
 		}
 		items, err := readHorizontalItems(rows, spec.DefineRow+1, fields)
 		if err != nil {
@@ -293,47 +303,25 @@ func main() {
 			fmt.Fprintf(os.Stderr, "generated %s\n", outFile)
 		}
 	}
-	if langs["Pb"] {
-		csCode, err := generateCSBundle(rootName, orderedTypeNames, schemas)
+	if langs["gd"] {
+		gdFiles, err := generateGDBundle(orderedTypeNames, schemas)
 		if err != nil {
 			exitErr(err)
 		}
-		outFile := filepath.Join(opts.OutDir, "Pb.gen.Pb")
-		if err := os.WriteFile(outFile, []byte(csCode), 0o644); err != nil {
+		gdDir := filepath.Join(opts.OutDir, "gd")
+		if err := os.MkdirAll(gdDir, 0o755); err != nil {
 			exitErr(err)
 		}
-		if opts.Verbose {
-			fmt.Fprintf(os.Stderr, "generated %s\n", outFile)
+		for name, content := range gdFiles {
+			outFile := filepath.Join(gdDir, name)
+			if err := os.WriteFile(outFile, []byte(content), 0o644); err != nil {
+				exitErr(err)
+			}
+			if opts.Verbose {
+				fmt.Fprintf(os.Stderr, "generated %s\n", outFile)
+			}
 		}
 	}
-	if langs["ts"] {
-		tsCode, err := generateTSBundle(rootName, orderedTypeNames, schemas)
-		if err != nil {
-			exitErr(err)
-		}
-		outFile := filepath.Join(opts.OutDir, "ts.gen.ts")
-		if err := os.WriteFile(outFile, []byte(tsCode), 0o644); err != nil {
-			exitErr(err)
-		}
-		if opts.Verbose {
-			fmt.Fprintf(os.Stderr, "generated %s\n", outFile)
-		}
-	}
-
-	if langs["rust"] {
-		rustCode, err := generateRustBundle(rootName, orderedTypeNames, schemas)
-		if err != nil {
-			exitErr(err)
-		}
-		outFile := filepath.Join(opts.OutDir, "config.gen.rs")
-		if err := os.WriteFile(outFile, []byte(rustCode), 0o644); err != nil {
-			exitErr(err)
-		}
-		if opts.Verbose {
-			fmt.Fprintf(os.Stderr, "generated %s\n", outFile)
-		}
-	}
-
 	if opts.JSON {
 		data, err := json.MarshalIndent(jsonPayload, "", "  ")
 		if err != nil {
@@ -358,27 +346,23 @@ func main() {
 func parseLangs(s string) (map[string]bool, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" || s == "all" {
-		return map[string]bool{"go": true, "Pb": true, "ts": true, "rust": false}, nil
+		return map[string]bool{"go": true, "gd": true}, nil
 	}
 	parts := strings.Split(s, ",")
-	out := map[string]bool{"go": false, "Pb": false, "ts": false, "rust": false}
+	out := map[string]bool{"go": false, "gd": false}
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
 		switch p {
-		case "go", "pb", "ts", "rust":
-			key := p
-			if key == "pb" {
-				key = "Pb"
-			}
-			out[key] = true
+		case "go", "gd":
+			out[p] = true
 		default:
-			return nil, fmt.Errorf("invalid --lang %q (expect go|Pb|ts|rust|all or comma-separated)", s)
+			return nil, fmt.Errorf("invalid --lang %q (expect go|gd|all or comma-separated)", s)
 		}
 	}
-	if !out["go"] && !out["Pb"] && !out["ts"] && !out["rust"] {
+	if !out["go"] && !out["gd"] {
 		return nil, fmt.Errorf("invalid --lang %q (no targets)", s)
 	}
 	return out, nil
@@ -534,107 +518,7 @@ func mapGoType(t string) (string, bool) {
 	}
 }
 
-func mapCSType(t string) (string, bool) {
-	switch strings.ToLower(t) {
-	case "int", "int32", "int64":
-		return "int", true
-	case "int[]":
-		return "List<int>", true
-	case "int[][]":
-		return "List<List<int>>", true
-	case "float", "float32", "float64":
-		return "double", true
-	case "bool":
-		return "bool", true
-	case "string":
-		return "string", true
-	default:
-		return "", false
-	}
-}
 
-func mapTSType(t string) (string, bool) {
-	switch strings.ToLower(t) {
-	case "int", "int32", "int64", "float", "float32", "float64":
-		return "number", true
-	case "int[]":
-		return "number[]", true
-	case "int[][]":
-		return "number[][]", true
-	case "bool":
-		return "boolean", true
-	case "string":
-		return "string", true
-	default:
-		return "", false
-	}
-}
-
-func generateGo(pkg, rootName, itemName string, fields []Field) (string, error) {
-	var b strings.Builder
-	b.WriteString("package ")
-	b.WriteString(pkg)
-	b.WriteString("\n\n")
-
-	b.WriteString("type ")
-	b.WriteString(rootName)
-	b.WriteString(" struct {\n")
-	b.WriteString("\tItems []")
-	b.WriteString(itemName)
-	b.WriteString("\n")
-	b.WriteString("}\n\n\n")
-
-	b.WriteString("type ")
-	b.WriteString(itemName)
-	b.WriteString(" struct {\n")
-	for _, f := range fields {
-		b.WriteString("\t")
-		b.WriteString(f.Name)
-		b.WriteString(" ")
-		b.WriteString(f.GoType)
-		b.WriteString(" `json:\"")
-		b.WriteString(f.RawName)
-		b.WriteString("\"`")
-		b.WriteString("\n")
-	}
-	b.WriteString("}\n")
-
-	return b.String(), nil
-}
-
-func generateCS(rootName, itemName string, fields []Field) (string, error) {
-	var b strings.Builder
-	b.WriteString("using System.Collections.Generic;\n")
-	b.WriteString("using System.Text.Json.Serialization;\n\n")
-
-	b.WriteString("public class ")
-	b.WriteString(rootName)
-	b.WriteString("\n{\n")
-	b.WriteString("    public List<")
-	b.WriteString(itemName)
-	b.WriteString("> Items { get; set; }\n")
-	b.WriteString("}\n\n")
-
-	b.WriteString("public class ")
-	b.WriteString(itemName)
-	b.WriteString("\n{\n")
-	for _, f := range fields {
-		csType, ok := mapCSType(f.RawType)
-		if !ok {
-			return "", fmt.Errorf("unsupported type %q", f.RawType)
-		}
-		b.WriteString("    [JsonPropertyName(\"")
-		b.WriteString(f.RawName)
-		b.WriteString("\")]\n")
-		b.WriteString("    public ")
-		b.WriteString(csType)
-		b.WriteString(" ")
-		b.WriteString(f.Name)
-		b.WriteString(" { get; set; }\n\n")
-	}
-	b.WriteString("}\n")
-	return b.String(), nil
-}
 
 func generateGoBundle(pkg, rootName string, orderedTypeNames []string, schemas map[string][]Field) (string, error) {
 	var b strings.Builder
@@ -680,118 +564,6 @@ func generateGoBundle(pkg, rootName string, orderedTypeNames []string, schemas m
 	return strings.TrimRight(b.String(), "\n") + "\n", nil
 }
 
-func generateCSBundle(rootName string, orderedTypeNames []string, schemas map[string][]Field) (string, error) {
-	var b strings.Builder
-	b.WriteString("using System.Collections.Generic;\n")
-	b.WriteString("using System.Text.Json.Serialization;\n\n")
-
-	b.WriteString("public class ")
-	b.WriteString(rootName)
-	b.WriteString("\n{\n")
-	for _, typeName := range orderedTypeNames {
-		fieldName := pluralizeTypeName(typeName)
-		jsonKey := lowerFirst(fieldName)
-		b.WriteString("    [JsonPropertyName(\"")
-		b.WriteString(jsonKey)
-		b.WriteString("\")]\n")
-		b.WriteString("    public List<")
-		b.WriteString(typeName)
-		b.WriteString("> ")
-		b.WriteString(fieldName)
-		b.WriteString(" { get; set; }\n\n")
-	}
-	b.WriteString("}\n\n")
-
-	for _, typeName := range orderedTypeNames {
-		fields := schemas[typeName]
-		b.WriteString("public class ")
-		b.WriteString(typeName)
-		b.WriteString("\n{\n")
-		for _, f := range fields {
-			csType, ok := mapCSType(f.RawType)
-			if !ok {
-				return "", fmt.Errorf("unsupported type %q", f.RawType)
-			}
-			b.WriteString("    [JsonPropertyName(\"")
-			b.WriteString(f.RawName)
-			b.WriteString("\")]\n")
-			b.WriteString("    public ")
-			b.WriteString(csType)
-			b.WriteString(" ")
-			b.WriteString(f.Name)
-			b.WriteString(" { get; set; }\n\n")
-		}
-		b.WriteString("}\n\n")
-	}
-
-	return strings.TrimRight(b.String(), "\n") + "\n", nil
-}
-
-func generateTSBundle(rootName string, orderedTypeNames []string, schemas map[string][]Field) (string, error) {
-	var b strings.Builder
-	for _, typeName := range orderedTypeNames {
-		fields := schemas[typeName]
-		b.WriteString("export interface ")
-		b.WriteString(typeName)
-		b.WriteString(" {\n")
-		for _, f := range fields {
-			tsType, ok := mapTSType(f.RawType)
-			if !ok {
-				return "", fmt.Errorf("unsupported type %q", f.RawType)
-			}
-			b.WriteString("  ")
-			b.WriteString(f.RawName)
-			b.WriteString(": ")
-			b.WriteString(tsType)
-			b.WriteString(";\n")
-		}
-		b.WriteString("}\n\n")
-	}
-
-	b.WriteString("export interface ")
-	b.WriteString(rootName)
-	b.WriteString(" {\n")
-	for _, typeName := range orderedTypeNames {
-		fieldName := pluralizeTypeName(typeName)
-		jsonKey := lowerFirst(fieldName)
-		b.WriteString("  ")
-		b.WriteString(jsonKey)
-		b.WriteString(": ")
-		b.WriteString(typeName)
-		b.WriteString("[];\n")
-	}
-	b.WriteString("}\n")
-
-	return b.String(), nil
-}
-
-func generateTS(rootName, itemName string, fields []Field) (string, error) {
-	var b strings.Builder
-	b.WriteString("export interface ")
-	b.WriteString(itemName)
-	b.WriteString(" {\n")
-	for _, f := range fields {
-		tsType, ok := mapTSType(f.RawType)
-		if !ok {
-			return "", fmt.Errorf("unsupported type %q", f.RawType)
-		}
-		b.WriteString("  ")
-		b.WriteString(f.RawName)
-		b.WriteString(": ")
-		b.WriteString(tsType)
-		b.WriteString(";\n")
-	}
-	b.WriteString("}\n\n")
-
-	b.WriteString("export interface ")
-	b.WriteString(rootName)
-	b.WriteString(" {\n")
-	b.WriteString("  Items: ")
-	b.WriteString(itemName)
-	b.WriteString("[];\n")
-	b.WriteString("}\n")
-	return b.String(), nil
-}
 
 func readHorizontalItems(rows [][]string, dataStartRow int, fields []Field) ([]map[string]any, error) {
 	if dataStartRow <= 0 {
@@ -909,18 +681,18 @@ func parseBraceArrayJSON(s string, out any) error {
 	return json.Unmarshal([]byte(s), out)
 }
 
-// ── Rust code generation ──
+// ── GDScript code generation ──
 
-func mapRustType(t string) (string, bool) {
+func mapGDType(t string) (string, bool) {
 	switch strings.ToLower(t) {
 	case "int", "int32", "int64":
-		return "i64", true
+		return "int", true
 	case "int[]":
-		return "Vec<i64>", true
+		return "Array[int]", true
 	case "int[][]":
-		return "Vec<Vec<i64>>", true
+		return "Array", true
 	case "float", "float32", "float64":
-		return "f64", true
+		return "float", true
 	case "bool":
 		return "bool", true
 	case "string":
@@ -928,6 +700,255 @@ func mapRustType(t string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func gdDefaultValue(gdType string) string {
+	switch gdType {
+	case "int":
+		return ""
+	case "float":
+		return ""
+	case "bool":
+		return ""
+	case "String":
+		return ""
+	case "Array[int]":
+		return " = []"
+	case "Array":
+		return " = []"
+	default:
+		return ""
+	}
+}
+
+func gdClassName(typeName string) string {
+	return "C" + typeName
+}
+
+func gdPluralClassName(typeName string) string {
+	return "C" + pluralizeTypeName(typeName)
+}
+
+func gdFileName(typeName string) string {
+	return "c_" + toSnakeCase(typeName) + ".gd"
+}
+
+func gdPluralFileName(typeName string) string {
+	return "c_" + toSnakeCase(pluralizeTypeName(typeName)) + ".gd"
+}
+
+func generateGDRowClass(typeName string, fields []Field) (string, error) {
+	var b strings.Builder
+	b.WriteString("# Auto-generated by genxls. DO NOT EDIT.\n")
+	b.WriteString("extends Resource\n")
+	b.WriteString("class_name ")
+	b.WriteString(gdClassName(typeName))
+	b.WriteString("\n\n")
+
+	cidFirst := reorderCidFirst(fields)
+	for _, f := range cidFirst {
+		gdType, ok := mapGDType(f.RawType)
+		if !ok {
+			return "", fmt.Errorf("unsupported type %q for GDScript", f.RawType)
+		}
+		b.WriteString("@export var ")
+		b.WriteString(toSnakeCase(f.Name))
+		b.WriteString(": ")
+		b.WriteString(gdType)
+		b.WriteString(gdDefaultValue(gdType))
+		b.WriteString("\n")
+	}
+	return b.String(), nil
+}
+
+func generateGDContainerClass(typeName string) string {
+	var b strings.Builder
+	b.WriteString("# Auto-generated by genxls. DO NOT EDIT.\n")
+	b.WriteString("extends Resource\n")
+	b.WriteString("class_name ")
+	b.WriteString(gdPluralClassName(typeName))
+	b.WriteString("\n\n")
+	b.WriteString("@export var items: Array[")
+	b.WriteString(gdClassName(typeName))
+	b.WriteString("] = []\n")
+	return b.String()
+}
+
+func generateGDAllConfig(orderedTypeNames []string) string {
+	var b strings.Builder
+	b.WriteString("# Auto-generated by genxls. DO NOT EDIT.\n")
+	b.WriteString("extends Resource\n")
+	b.WriteString("class_name CAllConfig\n\n")
+
+	for _, typeName := range orderedTypeNames {
+		snakeKey := toSnakeCase(pluralizeTypeName(typeName))
+		b.WriteString("@export var ")
+		b.WriteString(snakeKey)
+		b.WriteString(": Array[")
+		b.WriteString(gdClassName(typeName))
+		b.WriteString("] = []\n")
+	}
+	return b.String()
+}
+
+func generateGDImporter(orderedTypeNames []string, schemas map[string][]Field) (string, error) {
+	var b strings.Builder
+	b.WriteString("# Auto-generated by genxls. DO NOT EDIT.\n")
+	b.WriteString("extends SceneTree\n\n")
+	b.WriteString("const JSON_PATH = \"res://data/config/all.json\"\n")
+	b.WriteString("const OUT_DIR = \"res://data/generated/\"\n\n")
+
+	// Helper functions
+	b.WriteString("func _to_int_array(arr) -> Array[int]:\n")
+	b.WriteString("\tvar result: Array[int] = []\n")
+	b.WriteString("\tif arr is Array:\n")
+	b.WriteString("\t\tfor v in arr:\n")
+	b.WriteString("\t\t\tresult.append(int(v))\n")
+	b.WriteString("\treturn result\n\n")
+
+	b.WriteString("func _to_int_array_2d(arr) -> Array:\n")
+	b.WriteString("\tvar result: Array = []\n")
+	b.WriteString("\tif arr is Array:\n")
+	b.WriteString("\t\tfor sub in arr:\n")
+	b.WriteString("\t\t\tresult.append(_to_int_array(sub))\n")
+	b.WriteString("\treturn result\n\n")
+
+	b.WriteString("func _init():\n")
+	b.WriteString("\tvar file = FileAccess.open(JSON_PATH, FileAccess.READ)\n")
+	b.WriteString("\tif file == null:\n")
+	b.WriteString("\t\tprinterr(\"Failed to open: \", JSON_PATH)\n")
+	b.WriteString("\t\tquit(1)\n")
+	b.WriteString("\t\treturn\n")
+	b.WriteString("\tvar text = file.get_as_text()\n")
+	b.WriteString("\tfile.close()\n")
+	b.WriteString("\tvar data = JSON.parse_string(text)\n")
+	b.WriteString("\tif data == null:\n")
+	b.WriteString("\t\tprinterr(\"Failed to parse JSON\")\n")
+	b.WriteString("\t\tquit(1)\n")
+	b.WriteString("\t\treturn\n\n")
+	b.WriteString("\tDirAccess.make_dir_recursive_absolute(OUT_DIR)\n")
+	b.WriteString("\tvar config = CAllConfig.new()\n\n")
+
+	for _, typeName := range orderedTypeNames {
+		fields := schemas[typeName]
+		jsonKey := lowerFirst(pluralizeTypeName(typeName))
+		snakeKey := toSnakeCase(pluralizeTypeName(typeName))
+		containerVar := snakeKey + "_container"
+		className := gdClassName(typeName)
+		containerClass := gdPluralClassName(typeName)
+
+		b.WriteString("\t# --- ")
+		b.WriteString(typeName)
+		b.WriteString(" ---\n")
+		b.WriteString("\tvar ")
+		b.WriteString(containerVar)
+		b.WriteString(" = ")
+		b.WriteString(containerClass)
+		b.WriteString(".new()\n")
+		b.WriteString("\tfor entry in data.get(\"")
+		b.WriteString(jsonKey)
+		b.WriteString("\", []):\n")
+		b.WriteString("\t\tvar item = ")
+		b.WriteString(className)
+		b.WriteString(".new()\n")
+
+		for _, f := range fields {
+			gdType, ok := mapGDType(f.RawType)
+			if !ok {
+				return "", fmt.Errorf("unsupported type %q for GDScript", f.RawType)
+			}
+			snakeName := toSnakeCase(f.Name)
+			b.WriteString("\t\titem.")
+			b.WriteString(snakeName)
+			b.WriteString(" = ")
+			switch gdType {
+			case "int":
+				b.WriteString("int(entry.get(\"")
+				b.WriteString(f.RawName)
+				b.WriteString("\", 0))")
+			case "float":
+				b.WriteString("float(entry.get(\"")
+				b.WriteString(f.RawName)
+				b.WriteString("\", 0.0))")
+			case "bool":
+				b.WriteString("bool(entry.get(\"")
+				b.WriteString(f.RawName)
+				b.WriteString("\", false))")
+			case "String":
+				b.WriteString("str(entry.get(\"")
+				b.WriteString(f.RawName)
+				b.WriteString("\", \"\"))")
+			case "Array[int]":
+				b.WriteString("_to_int_array(entry.get(\"")
+				b.WriteString(f.RawName)
+				b.WriteString("\", []))")
+			case "Array":
+				b.WriteString("_to_int_array_2d(entry.get(\"")
+				b.WriteString(f.RawName)
+				b.WriteString("\", []))")
+			}
+			b.WriteString("\n")
+		}
+
+		b.WriteString("\t\t")
+		b.WriteString(containerVar)
+		b.WriteString(".items.append(item)\n")
+		b.WriteString("\t\tconfig.")
+		b.WriteString(snakeKey)
+		b.WriteString(".append(item)\n")
+		b.WriteString("\tResourceSaver.save(")
+		b.WriteString(containerVar)
+		b.WriteString(", OUT_DIR + \"")
+		b.WriteString(jsonKey)
+		b.WriteString(".res\")\n")
+		b.WriteString("\tprint(\"  saved: ")
+		b.WriteString(jsonKey)
+		b.WriteString(".res\")\n\n")
+	}
+
+	b.WriteString("\tResourceSaver.save(config, OUT_DIR + \"game_config.res\")\n")
+	b.WriteString("\tprint(\"saved: game_config.res (")
+	b.WriteString(fmt.Sprintf("%d", len(orderedTypeNames)))
+	b.WriteString(" tables)\")\n")
+	b.WriteString("\tquit()\n")
+	return b.String(), nil
+}
+
+func generateGDBundle(orderedTypeNames []string, schemas map[string][]Field) (map[string]string, error) {
+	files := make(map[string]string)
+
+	for _, typeName := range orderedTypeNames {
+		fields := schemas[typeName]
+
+		rowCode, err := generateGDRowClass(typeName, fields)
+		if err != nil {
+			return nil, err
+		}
+		files[gdFileName(typeName)] = rowCode
+		files[gdPluralFileName(typeName)] = generateGDContainerClass(typeName)
+	}
+
+	files["c_all_config.gd"] = generateGDAllConfig(orderedTypeNames)
+
+	importerCode, err := generateGDImporter(orderedTypeNames, schemas)
+	if err != nil {
+		return nil, err
+	}
+	files["res_importer.gd"] = importerCode
+
+	return files, nil
+}
+
+func reorderCidFirst(fields []Field) []Field {
+	result := make([]Field, 0, len(fields))
+	for _, f := range fields {
+		if f.RawName == "cid" {
+			result = append([]Field{f}, result...)
+		} else {
+			result = append(result, f)
+		}
+	}
+	return result
 }
 
 func toSnakeCase(s string) string {
@@ -948,61 +969,6 @@ func toSnakeCase(s string) string {
 	return buf.String()
 }
 
-func generateRustBundle(rootName string, orderedTypeNames []string, schemas map[string][]Field) (string, error) {
-	var b strings.Builder
-	b.WriteString("// Auto-generated by genxls. DO NOT EDIT.\n\n")
-	b.WriteString("use serde::Deserialize;\n\n")
-
-	for _, typeName := range orderedTypeNames {
-		fields := schemas[typeName]
-		b.WriteString("#[derive(Debug, Clone, Deserialize)]\n")
-		b.WriteString("pub struct ")
-		b.WriteString(typeName)
-		b.WriteString(" {\n")
-		for _, f := range fields {
-			rustType, ok := mapRustType(f.RawType)
-			if !ok {
-				return "", fmt.Errorf("unsupported type %q for Rust", f.RawType)
-			}
-			snakeName := toSnakeCase(f.Name)
-			if snakeName != f.RawName {
-				b.WriteString("    #[serde(rename = \"")
-				b.WriteString(f.RawName)
-				b.WriteString("\")]\n")
-			}
-			b.WriteString("    pub ")
-			b.WriteString(snakeName)
-			b.WriteString(": ")
-			b.WriteString(rustType)
-			b.WriteString(",\n")
-		}
-		b.WriteString("}\n\n")
-	}
-
-	b.WriteString("#[derive(Debug, Clone, Deserialize)]\n")
-	b.WriteString("pub struct ")
-	b.WriteString(rootName)
-	b.WriteString(" {\n")
-	for _, typeName := range orderedTypeNames {
-		fieldName := pluralizeTypeName(typeName)
-		jsonKey := lowerFirst(fieldName)
-		snakeName := toSnakeCase(fieldName)
-		if snakeName != jsonKey {
-			b.WriteString("    #[serde(rename = \"")
-			b.WriteString(jsonKey)
-			b.WriteString("\")]\n")
-		}
-		b.WriteString("    pub ")
-		b.WriteString(snakeName)
-		b.WriteString(": Vec<")
-		b.WriteString(typeName)
-		b.WriteString(">,\n")
-	}
-	b.WriteString("}\n")
-
-	return b.String(), nil
-}
-
 // ── Split JSON + Manifest ──
 
 type ManifestTableEntry struct {
@@ -1010,7 +976,7 @@ type ManifestTableEntry struct {
 	Sha256   string `json:"sha256"`
 	Size     int64  `json:"size"`
 	RowCount int    `json:"row_count"`
-	RustType string `json:"rust_type"`
+	TypeName string `json:"type_name"`
 }
 
 type ManifestFile struct {
@@ -1056,7 +1022,7 @@ func writeSplitJSONAndManifest(outDir string, jsonPayload map[string]any, ordere
 			Sha256:   hex.EncodeToString(h[:]),
 			Size:     int64(len(data)),
 			RowCount: rowCount,
-			RustType: typeName,
+			TypeName: typeName,
 		}
 
 		if verbose {
