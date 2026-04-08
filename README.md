@@ -29,6 +29,10 @@ This will generate (with `--lang all`):
 |------|---------|-------------|
 | `--in` | `./xls` | Input xlsx file or directory |
 | `--out` | `.` | Output directory |
+| `--gd-out` | `<out>/gd` | GDScript（`c_*.gd` 等）输出目录；默认也会写入 **`res_importer.gd`**（除非仅用 **`--res-importer-out`** 单独指定） |
+| `--res-importer-out` | _(empty)_ | 若指定，仅将 **`res_importer.gd`** 写到该目录（不写进 `--gd-out`）。**`comm/gen_client.bat`** 将其设为 **`comm/tools/scripts`**，再复制到 **`gclient/data/generated/gd/`**。 |
+| `--gclient` | _(empty)_ | Godot 工程根：导出后无头执行 **`res://data/generated/gd/res_importer.gd`**，在 **`data/generated/`** 下写入 **`all.res`**、`tables/*.res`。要求 **`--out`** = `<gclient>/data/config`、**`--gd-out`** = `<gclient>/data/generated/gd`**，且 **`--lang gd`**、**`--json=true`**。 |
+| `--godot` | _(empty)_ | Godot executable; else `GODOT` env; else `<dir-of-genxls>/protoc-gen-gd.exe` (same convention as genpb: renamed Godot binary). |
 | `--lang` | `all` | Target languages: `go`, `pb`, `ts`, `rust`, `all` (comma-separated) |
 | `--pkg` | `config` | Go package name |
 | `--flag` | _(none)_ | Export filter: `server` \| `client` |

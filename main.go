@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"regexp"
 	"sort"
 	"strconv"
@@ -167,20 +169,28 @@ type HeaderSpec struct {
 }
 
 type Options struct {
-	InPath   string
-	OutDir   string
-	Flag     string
-	Lang     string
-	Pkg      string
-	JSON     bool
-	SplitJSON bool
-	Verbose  bool
+	InPath           string
+	OutDir           string
+	GdOutDir         string
+	ResImporterOut   string // if set, res_importer.gd is written here only, not under gd-out
+	GclientDir       string
+	GodotBin         string
+	Flag             string
+	Lang             string
+	Pkg              string
+	JSON             bool
+	SplitJSON        bool
+	Verbose          bool
 }
 
 func main() {
 	var opts Options
 	flag.StringVar(&opts.InPath, "in", "", "input xlsx file or directory (default: ./xls)")
 	flag.StringVar(&opts.OutDir, "out", ".", "output directory")
+	flag.StringVar(&opts.GdOutDir, "gd-out", "", "GDScript output directory (default: <out>/gd)")
+	flag.StringVar(&opts.ResImporterOut, "res-importer-out", "", "if set, write res_importer.gd only to this directory (not under gd-out)")
+	flag.StringVar(&opts.GclientDir, "gclient", "", "Godot client project root (enables .res import via protoc-gen-gd.exe next to genxls)")
+	flag.StringVar(&opts.GodotBin, "godot", "", "Godot executable (default: GODOT env, else <genxls_dir>/protoc-gen-gd.exe)")
 	flag.StringVar(&opts.Flag, "flag", "", "export flag: server|client (optional)")
 	flag.StringVar(&opts.Lang, "lang", "all", "target lang: go|gd|all (or comma-separated)")
 	flag.StringVar(&opts.Pkg, "pkg", "config", "go package name")
@@ -308,9 +318,34 @@ func main() {
 		if err != nil {
 			exitErr(err)
 		}
-		gdDir := filepath.Join(opts.OutDir, "gd")
+		gdDir := opts.GdOutDir
+		if gdDir == "" {
+			gdDir = filepath.Join(opts.OutDir, "gd")
+		}
 		if err := os.MkdirAll(gdDir, 0o755); err != nil {
 			exitErr(err)
+		}
+		impOut := strings.TrimSpace(opts.ResImporterOut)
+		if impOut != "" {
+			impOut, err = filepath.Abs(impOut)
+			if err != nil {
+				exitErr(err)
+			}
+			if err := os.MkdirAll(impOut, 0o755); err != nil {
+				exitErr(err)
+			}
+			impCode, ok := gdFiles["res_importer.gd"]
+			if !ok {
+				exitErr(errors.New("internal: res_importer.gd missing from gd bundle"))
+			}
+			impPath := filepath.Join(impOut, "res_importer.gd")
+			if err := os.WriteFile(impPath, []byte(impCode), 0o644); err != nil {
+				exitErr(err)
+			}
+			if opts.Verbose {
+				fmt.Fprintf(os.Stderr, "generated %s\n", impPath)
+			}
+			delete(gdFiles, "res_importer.gd")
 		}
 		for name, content := range gdFiles {
 			outFile := filepath.Join(gdDir, name)
@@ -341,6 +376,125 @@ func main() {
 			exitErr(err)
 		}
 	}
+
+	if strings.TrimSpace(opts.GclientDir) != "" {
+		if err := runGclientResImport(&opts, langs); err != nil {
+			exitErr(err)
+		}
+	}
+}
+
+// runGclientResImport copies res_importer into gclient/data/generated/gd and runs Godot headless (-s res://data/generated/gd/res_importer.gd).
+func runGclientResImport(opts *Options, langs map[string]bool) error {
+	if !langs["gd"] {
+		return errors.New("--gclient requires --lang to include gd")
+	}
+	if !opts.JSON {
+		return errors.New("--gclient requires --json=true (res_importer reads res://data/config/all.json)")
+	}
+	gclientAbs, err := filepath.Abs(strings.TrimSpace(opts.GclientDir))
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(gclientAbs, "project.godot")); err != nil {
+		return fmt.Errorf("Godot project not found: %w", err)
+	}
+	gdDir := opts.GdOutDir
+	if gdDir == "" {
+		gdDir = filepath.Join(opts.OutDir, "gd")
+	}
+	gdAbs, err := filepath.Abs(gdDir)
+	if err != nil {
+		return err
+	}
+	wantGd := filepath.Join(gclientAbs, "data", "generated", "gd")
+	wantGdAbs, _ := filepath.Abs(wantGd)
+	if filepath.Clean(gdAbs) != filepath.Clean(wantGdAbs) {
+		return fmt.Errorf("--gd-out must be <gclient>/data/generated/gd (got %s)", gdAbs)
+	}
+	jsonAbs, err := filepath.Abs(filepath.Join(opts.OutDir, "all.json"))
+	if err != nil {
+		return err
+	}
+	wantJSON, _ := filepath.Abs(filepath.Join(gclientAbs, "data", "config", "all.json"))
+	if filepath.Clean(jsonAbs) != filepath.Clean(wantJSON) {
+		return fmt.Errorf("--out must be <gclient>/data/config so all.json matches res_importer (got out dir %s)", opts.OutDir)
+	}
+	godotPath, err := resolveGodotForGenxls(opts.GodotBin)
+	if err != nil {
+		return err
+	}
+	if err := syncResImporterToGD(opts, gdAbs, gclientAbs); err != nil {
+		return err
+	}
+	args := []string{"--headless", "--path", gclientAbs, "-s", "res://data/generated/gd/res_importer.gd"}
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "running: %s %v\n", godotPath, args)
+	}
+	cmd := exec.Command(godotPath, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("godot res import: %w", err)
+	}
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "generated resources under %s\n", filepath.Join(gclientAbs, "data", "generated"))
+	}
+	return nil
+}
+
+func resolveGodotForGenxls(explicit string) (string, error) {
+	if s := strings.TrimSpace(explicit); s != "" {
+		if _, err := os.Stat(s); err != nil {
+			return "", fmt.Errorf("--godot: %w", err)
+		}
+		return s, nil
+	}
+	if env := strings.TrimSpace(os.Getenv("GODOT")); env != "" {
+		if _, err := os.Stat(env); err != nil {
+			return "", fmt.Errorf("GODOT env: %w", err)
+		}
+		return env, nil
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	exeDir := filepath.Dir(exePath)
+	name := "protoc-gen-gd"
+	if runtime.GOOS == "windows" {
+		name = "protoc-gen-gd.exe"
+	}
+	candidate := filepath.Join(exeDir, name)
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate, nil
+	}
+	return "", fmt.Errorf("Godot not found (need %s beside genxls.exe, or set --godot / GODOT)", name)
+}
+
+func syncResImporterToGD(opts *Options, gdAbs, gclientAbs string) error {
+	var src string
+	if s := strings.TrimSpace(opts.ResImporterOut); s != "" {
+		abs, err := filepath.Abs(s)
+		if err != nil {
+			return err
+		}
+		src = filepath.Join(abs, "res_importer.gd")
+	} else {
+		src = filepath.Join(gdAbs, "res_importer.gd")
+	}
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("res_importer.gd: %w", err)
+	}
+	if err := os.MkdirAll(gdAbs, 0o755); err != nil {
+		return err
+	}
+	dst := filepath.Join(gdAbs, "res_importer.gd")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, b, 0o644)
 }
 
 func parseLangs(s string) (map[string]bool, error) {
@@ -768,9 +922,8 @@ func generateGDContainerClass(typeName string) string {
 	b.WriteString("class_name ")
 	b.WriteString(gdPluralClassName(typeName))
 	b.WriteString("\n\n")
-	b.WriteString("@export var items: Array[")
-	b.WriteString(gdClassName(typeName))
-	b.WriteString("] = []\n")
+	// Untyped Array so headless res_importer can load() scripts without global class_name order.
+	b.WriteString("@export var items: Array = []\n")
 	return b.String()
 }
 
@@ -784,9 +937,7 @@ func generateGDAllConfig(orderedTypeNames []string) string {
 		snakeKey := toSnakeCase(pluralizeTypeName(typeName))
 		b.WriteString("@export var ")
 		b.WriteString(snakeKey)
-		b.WriteString(": Array[")
-		b.WriteString(gdClassName(typeName))
-		b.WriteString("] = []\n")
+		b.WriteString(": Array = []\n")
 	}
 	return b.String()
 }
@@ -795,8 +946,10 @@ func generateGDImporter(orderedTypeNames []string, schemas map[string][]Field) (
 	var b strings.Builder
 	b.WriteString("# Auto-generated by genxls. DO NOT EDIT.\n")
 	b.WriteString("extends SceneTree\n\n")
-	b.WriteString("const JSON_PATH = \"res://data/config/all.json\"\n")
-	b.WriteString("const OUT_DIR = \"res://data/generated/\"\n\n")
+	b.WriteString("# Uses load() for row/container scripts so --headless -s works without global class_name parse order.\n")
+	b.WriteString("const JSON_PATH := \"res://data/config/all.json\"\n")
+	b.WriteString("const OUT_ALL := \"res://data/generated/all.res\"\n")
+	b.WriteString("const OUT_TABLES := \"res://data/generated/tables\"\n\n")
 
 	// Helper functions
 	b.WriteString("func _to_int_array(arr) -> Array[int]:\n")
@@ -813,7 +966,7 @@ func generateGDImporter(orderedTypeNames []string, schemas map[string][]Field) (
 	b.WriteString("\t\t\tresult.append(_to_int_array(sub))\n")
 	b.WriteString("\treturn result\n\n")
 
-	b.WriteString("func _init():\n")
+	b.WriteString("func _initialize() -> void:\n")
 	b.WriteString("\tvar file = FileAccess.open(JSON_PATH, FileAccess.READ)\n")
 	b.WriteString("\tif file == null:\n")
 	b.WriteString("\t\tprinterr(\"Failed to open: \", JSON_PATH)\n")
@@ -826,30 +979,42 @@ func generateGDImporter(orderedTypeNames []string, schemas map[string][]Field) (
 	b.WriteString("\t\tprinterr(\"Failed to parse JSON\")\n")
 	b.WriteString("\t\tquit(1)\n")
 	b.WriteString("\t\treturn\n\n")
-	b.WriteString("\tDirAccess.make_dir_recursive_absolute(OUT_DIR)\n")
-	b.WriteString("\tvar config = CAllConfig.new()\n\n")
+	b.WriteString("\tDirAccess.make_dir_recursive_absolute(\"res://data/generated\")\n")
+	b.WriteString("\tDirAccess.make_dir_recursive_absolute(OUT_TABLES)\n")
+	b.WriteString("\tvar AllCfgScript = load(\"res://data/generated/gd/c_all_config.gd\")\n")
+	b.WriteString("\tvar config = AllCfgScript.new()\n\n")
 
 	for _, typeName := range orderedTypeNames {
 		fields := schemas[typeName]
 		jsonKey := lowerFirst(pluralizeTypeName(typeName))
 		snakeKey := toSnakeCase(pluralizeTypeName(typeName))
 		containerVar := snakeKey + "_container"
-		className := gdClassName(typeName)
-		containerClass := gdPluralClassName(typeName)
+		rowScriptVar := snakeKey + "_row_script"
+		ctrScriptVar := snakeKey + "_ctr_script"
 
 		b.WriteString("\t# --- ")
 		b.WriteString(typeName)
 		b.WriteString(" ---\n")
 		b.WriteString("\tvar ")
+		b.WriteString(rowScriptVar)
+		b.WriteString(" = load(\"res://data/generated/gd/")
+		b.WriteString(gdFileName(typeName))
+		b.WriteString("\")\n")
+		b.WriteString("\tvar ")
+		b.WriteString(ctrScriptVar)
+		b.WriteString(" = load(\"res://data/generated/gd/")
+		b.WriteString(gdPluralFileName(typeName))
+		b.WriteString("\")\n")
+		b.WriteString("\tvar ")
 		b.WriteString(containerVar)
 		b.WriteString(" = ")
-		b.WriteString(containerClass)
+		b.WriteString(ctrScriptVar)
 		b.WriteString(".new()\n")
 		b.WriteString("\tfor entry in data.get(\"")
 		b.WriteString(jsonKey)
 		b.WriteString("\", []):\n")
 		b.WriteString("\t\tvar item = ")
-		b.WriteString(className)
+		b.WriteString(rowScriptVar)
 		b.WriteString(".new()\n")
 
 		for _, f := range fields {
@@ -898,7 +1063,7 @@ func generateGDImporter(orderedTypeNames []string, schemas map[string][]Field) (
 		b.WriteString(".append(item)\n")
 		b.WriteString("\tResourceSaver.save(")
 		b.WriteString(containerVar)
-		b.WriteString(", OUT_DIR + \"")
+		b.WriteString(", OUT_TABLES + \"/")
 		b.WriteString(jsonKey)
 		b.WriteString(".res\")\n")
 		b.WriteString("\tprint(\"  saved: ")
@@ -906,8 +1071,8 @@ func generateGDImporter(orderedTypeNames []string, schemas map[string][]Field) (
 		b.WriteString(".res\")\n\n")
 	}
 
-	b.WriteString("\tResourceSaver.save(config, OUT_DIR + \"game_config.res\")\n")
-	b.WriteString("\tprint(\"saved: game_config.res (")
+	b.WriteString("\tResourceSaver.save(config, OUT_ALL)\n")
+	b.WriteString("\tprint(\"saved: all.res + tables/*.res (")
 	b.WriteString(fmt.Sprintf("%d", len(orderedTypeNames)))
 	b.WriteString(" tables)\")\n")
 	b.WriteString("\tquit()\n")
